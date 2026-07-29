@@ -1850,23 +1850,38 @@ func addNetworks(quadletUnitFile *parser.UnitFile, groupName string, serviceUnit
 	for _, network := range networks {
 		if len(network) > 0 {
 			quadletNetworkName, options, found := strings.Cut(network, ":")
+			quadletNetworkName = expandNSpecifier(quadletNetworkName, quadletUnitFile)
 
 			isNetworkUnit := strings.HasSuffix(quadletNetworkName, ".network")
 			isContainerUnit := strings.HasSuffix(quadletNetworkName, ".container")
 
 			if isNetworkUnit || isContainerUnit {
-				unitInfo, ok := unitsInfoMap[quadletNetworkName]
-				if !ok {
-					return fmt.Errorf("requested Quadlet unit %s was not found", quadletNetworkName)
+				var unitInfo *UnitInfo
+				var instance string
+				if isNetworkUnit {
+					var err error
+					unitInfo, instance, err = resolveUnitRef(quadletNetworkName, unitsInfoMap)
+					if err != nil {
+						return fmt.Errorf("requested Quadlet unit %s was not found", quadletNetworkName)
+					}
+				} else {
+					var ok bool
+					unitInfo, ok = unitsInfoMap[quadletNetworkName]
+					if !ok {
+						return fmt.Errorf("requested Quadlet unit %s was not found", quadletNetworkName)
+					}
 				}
 
+				resourceName := resourceNameForInstance(unitInfo, instance)
 				// XXX: this is usually because a '@' in service name
-				if len(unitInfo.ResourceName) == 0 {
+				if len(resourceName) == 0 {
 					return fmt.Errorf("cannot get the resource name of %s", quadletNetworkName)
 				}
 
-				// the systemd unit name is $serviceName.service
-				serviceFileName := unitInfo.ServiceFileName()
+				serviceFileName, err := serviceFileNameForInstance(unitInfo, instance)
+				if err != nil {
+					return err
+				}
 
 				serviceUnitFile.Add(UnitGroup, "Requires", serviceFileName)
 				serviceUnitFile.Add(UnitGroup, "After", serviceFileName)
@@ -1875,12 +1890,12 @@ func addNetworks(quadletUnitFile *parser.UnitFile, groupName string, serviceUnit
 					if isContainerUnit {
 						return fmt.Errorf("extra options are not supported when joining another container's network")
 					}
-					network = fmt.Sprintf("%s:%s", unitInfo.ResourceName, options)
+					network = fmt.Sprintf("%s:%s", resourceName, options)
 				} else {
 					if isContainerUnit {
-						network = fmt.Sprintf("container:%s", unitInfo.ResourceName)
+						network = fmt.Sprintf("container:%s", resourceName)
 					} else {
-						network = unitInfo.ResourceName
+						network = resourceName
 					}
 				}
 			}
@@ -1967,20 +1982,95 @@ func handleStorageSource(quadletUnitFile, serviceUnitFile *parser.UnitFile, sour
 		// Absolute path
 		serviceUnitFile.AddEscaped(UnitGroup, "RequiresMountsFor", source)
 	} else if strings.HasSuffix(source, ".volume") || (checkImage && strings.HasSuffix(source, ".image")) || strings.HasSuffix(source, ".artifact") {
-		sourceUnitInfo, ok := unitsInfoMap[source]
-		if !ok {
-			return "", fmt.Errorf("requested Quadlet source %s was not found", source)
+		source = expandNSpecifier(source, quadletUnitFile)
+
+		var sourceUnitInfo *UnitInfo
+		var instance string
+		if strings.HasSuffix(source, ".volume") {
+			var err error
+			sourceUnitInfo, instance, err = resolveUnitRef(source, unitsInfoMap)
+			if err != nil {
+				return "", fmt.Errorf("requested Quadlet source %s was not found", source)
+			}
+		} else {
+			var ok bool
+			sourceUnitInfo, ok = unitsInfoMap[source]
+			if !ok {
+				return "", fmt.Errorf("requested Quadlet source %s was not found", source)
+			}
 		}
 
-		// the systemd unit name is $serviceName.service
-		sourceServiceName := sourceUnitInfo.ServiceFileName()
+		sourceServiceName, err := serviceFileNameForInstance(sourceUnitInfo, instance)
+		if err != nil {
+			return "", err
+		}
 		serviceUnitFile.Add(UnitGroup, "Requires", sourceServiceName)
 		serviceUnitFile.Add(UnitGroup, "After", sourceServiceName)
 
-		source = sourceUnitInfo.ResourceName
+		source = resourceNameForInstance(sourceUnitInfo, instance)
 	}
 
 	return source, nil
+}
+
+// expandNSpecifier replaces %N with the consuming unit's service name when it is
+// known at generation time. Template units (service name ending in '@') keep %N
+// so systemd can expand it when an instance starts.
+func expandNSpecifier(source string, unit *parser.UnitFile) string {
+	if !strings.Contains(source, "%N") {
+		return source
+	}
+	serviceName, err := GetUnitServiceName(unit)
+	if err != nil || serviceName == "" || strings.HasSuffix(serviceName, "@") {
+		return source
+	}
+	return strings.ReplaceAll(source, "%N", serviceName)
+}
+
+// resolveUnitRef looks up a Quadlet unit by exact name, or as a template instance
+// reference (name@instance.ext → name@.ext). instance is empty for exact matches.
+func resolveUnitRef(source string, unitsInfoMap map[string]*UnitInfo) (*UnitInfo, string, error) {
+	if info, ok := unitsInfoMap[source]; ok {
+		return info, "", nil
+	}
+
+	ext := filepath.Ext(source)
+	if ext == "" {
+		return nil, "", fmt.Errorf("unit %s not found", source)
+	}
+	base := strings.TrimSuffix(source, ext)
+	templateBase, instance, found := strings.Cut(base, "@")
+	if !found || templateBase == "" || instance == "" {
+		return nil, "", fmt.Errorf("unit %s not found", source)
+	}
+
+	templateKey := templateBase + "@" + ext
+	info, ok := unitsInfoMap[templateKey]
+	if !ok {
+		return nil, "", fmt.Errorf("unit %s not found", source)
+	}
+	return info, instance, nil
+}
+
+// serviceFileNameForInstance returns the systemd service file name for a unit,
+// optionally instantiated when instance is non-empty (template@instance.service).
+func serviceFileNameForInstance(info *UnitInfo, instance string) (string, error) {
+	if instance == "" {
+		return info.ServiceFileName(), nil
+	}
+	if !strings.HasSuffix(info.ServiceName, "@") {
+		return "", fmt.Errorf("cannot instantiate non-template service %s", info.ServiceName)
+	}
+	return info.ServiceName + instance + ".service", nil
+}
+
+// resourceNameForInstance returns the podman resource name, substituting the
+// template instance for %i when instance is non-empty.
+func resourceNameForInstance(info *UnitInfo, instance string) string {
+	if instance == "" {
+		return info.ResourceName
+	}
+	return strings.ReplaceAll(info.ResourceName, "%i", instance)
 }
 
 func handleHealth(unitFile *parser.UnitFile, groupName string, podman *PodmanCmdline) {
